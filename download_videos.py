@@ -66,6 +66,11 @@ WISTIA_EMBED_RE = re.compile(r"(?:fast\.wistia\.(?:com|net)/embed/(?:iframe|medi
 POST_HREF_RE = re.compile(r'href="([^"#?]*?/posts/[^"#?]+)"', re.I)
 PRODUCT_HREF_RE = re.compile(r'href="([^"#?]*?/(?:library/)?products/[^"#?]+)"', re.I)
 CATEGORY_HREF_RE = re.compile(r'href="([^"#?]*?/categories/[^"#?]+)"', re.I)
+CATEGORY_LINK_RE = re.compile(
+    r'<a[^>]+href="[^"]+/categories/(\d+)"[^>]*>(.*?)</a>', re.I | re.S
+)
+POST_CATEGORY_RE = re.compile(r"/categories/(\d+)/posts/")
+PRODUCT_SLUG_RE = re.compile(r"/products/([^/]+)")
 
 
 def session_factory():
@@ -153,6 +158,28 @@ def discover_products(session):
     return products
 
 
+def discover_product_meta(session, product_url):
+    """Return (product_title, {category_id: category_name}) for a product."""
+    try:
+        r = session.get(product_url, timeout=30)
+        r.raise_for_status()
+    except requests.RequestException as exc:
+        print(f"[!] Could not load {product_url}: {exc}")
+        return "", {}
+    page = r.text
+    title = (
+        _text(r'<h1[^>]*class="[^"]*(?:product|mini-dashboard)[^"]*title[^"]*"[^>]*>(.*?)</h1>', page)
+        or _text(r"<h1[^>]*>(.*?)</h1>", page)
+    )
+    title = re.sub(r"<[^>]+>", "", title).strip()
+    modules = {}
+    for cid, label in CATEGORY_LINK_RE.findall(page):
+        name = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", label)).strip()
+        if name and cid not in modules:
+            modules[cid] = name
+    return title, modules
+
+
 def discover_posts(session, product_url):
     """Crawl a product (and its category pages) and return ordered, unique lesson URLs."""
     posts = []
@@ -192,8 +219,12 @@ def _text(pattern, page_html, default=""):
     return html.unescape(m.group(1)).strip() if m else default
 
 
+def _strip_html(value):
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", value)).strip()
+
+
 def parse_post(session, url):
-    """Fetch a lesson page and extract its title and Wistia hashed id."""
+    """Fetch a lesson page and extract its title, description and Wistia hashed id."""
     try:
         r = session.get(url, timeout=30)
         r.raise_for_status()
@@ -211,8 +242,27 @@ def parse_post(session, url):
         or _text(r"<h1[^>]*>(.*?)</h1>", page)
         or _text(r"<title>(.*?)</title>", page)
     )
-    title = re.sub(r"<[^>]+>", "", title).strip()
-    return {"url": url, "title": title or "Untitled", "hashed_id": hashed_id}
+    title = _strip_html(title)
+
+    body_match = re.search(r'<div[^>]*class="[^"]*post-body[^"]*"[^>]*>(.*?)</div>\s*</div>', page, re.S)
+    description = ""
+    if body_match:
+        plain = _strip_html(html.unescape(body_match.group(1)))
+        # Trim the leading "Title View Time= 5:51" boilerplate Kajabi prints above the body.
+        plain = re.sub(r"^.{0,200}?View Time\s*=\s*\d+:\d+\s*", "", plain, count=1, flags=re.I)
+        # And strip the title itself if it leads.
+        if title and plain.startswith(title):
+            plain = plain[len(title):].lstrip(" -|:")
+        description = plain.strip()
+
+    cat_id_match = POST_CATEGORY_RE.search(url)
+    return {
+        "url": url,
+        "title": title or "Untitled",
+        "description": description,
+        "hashed_id": hashed_id,
+        "category_id": cat_id_match.group(1) if cat_id_match else "",
+    }
 
 
 def wistia_meta(hashed_id):
@@ -256,29 +306,41 @@ def _xml(value):
     )
 
 
-def write_nfo(video, out_path, course):
+def write_nfo(video, out_path):
     nfo_path = out_path.with_suffix(".nfo")
     if nfo_path.exists():
         return
     title = video.get("title", "")
+    course = video.get("course", "")
+    module = video.get("module", "")
     order = video.get("order", 0)
+    plot = video.get("description", "")
     duration = video.get("duration", "")
-    runtime = ""
     try:
         runtime = str(round(float(duration) / 60)) if duration else ""
     except (TypeError, ValueError):
         runtime = ""
+
+    extra_lines = []
+    if module:
+        extra_lines.append(f"  <tag>{_xml(module)}</tag>")
+    if runtime:
+        extra_lines.append(f"  <runtime>{_xml(runtime)}</runtime>")
+    extras = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
+
     nfo = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <movie>
   <title>{_xml(title)}</title>
   <originaltitle>{_xml(title)}</originaltitle>
   <sorttitle>{order:03d} - {_xml(title)}</sorttitle>
+  <plot>{_xml(plot)}</plot>
+  <outline>{_xml(plot[:240])}</outline>
   <set><name>{_xml(course)}</name></set>
   <studio>FlyAOA Media</studio>
   <genre>Education</genre>
   <tag>{_xml(course)}</tag>
   <uniqueid type="wistia" default="true">{_xml(video.get("hashed_id", ""))}</uniqueid>
-  <source>{_xml(video.get("url", ""))}</source>{f'{chr(10)}  <runtime>{_xml(runtime)}</runtime>' if runtime else ''}
+  <source>{_xml(video.get("url", ""))}</source>{extras}
 </movie>
 """
     nfo_path.write_text(nfo, encoding="utf-8")
@@ -376,15 +438,20 @@ def main():
 
     all_videos = []
     for product_url in products:
-        course = safe_filename(product_url.rstrip("/").split("/")[-1].replace("-", " ").title())
+        product_title, modules = discover_product_meta(session, product_url)
+        slug = PRODUCT_SLUG_RE.search(product_url)
+        slug = slug.group(1) if slug else product_url.rstrip("/").split("/")[-1]
+        course = safe_filename(product_title or slug.replace("-", " ").title())
         print(f"\n[*] Product: {course} ({product_url})")
         posts = discover_posts(session, product_url)
-        print(f"    {len(posts)} lesson(s)")
+        print(f"    {len(posts)} lesson(s) across {len(modules)} module(s)")
         for order, post_url in enumerate(posts, 1):
             info = parse_post(session, post_url)
             if not info:
                 continue
             info["course"] = course
+            info["product_slug"] = slug
+            info["module"] = modules.get(info.get("category_id", ""), "")
             info["order"] = order
             info.update({k: v for k, v in wistia_meta(info["hashed_id"]).items() if v})
             all_videos.append(info)
@@ -398,7 +465,8 @@ def main():
     if args.list:
         for v in all_videos:
             flag = "video" if v.get("hashed_id") else "no-video"
-            print(f"  [{flag}] {v['course']} / {v['order']:03d} - {v['title']}")
+            mod = f" [{v['module']}]" if v.get("module") else ""
+            print(f"  [{flag}] {v['course']}{mod} / {v['order']:03d} - {v['title']}")
         return
 
     if args.metadata_only:
@@ -417,11 +485,12 @@ def main():
         filename = f"{video['order']:03d} - {safe_filename(video['title'])}"
         out_path = course_dir / f"{filename}.mp4"
 
-        print(f"\n[{i}/{len(videos)}] {video['course']} / {filename}")
+        mod = f" [{video['module']}]" if video.get("module") else ""
+        print(f"\n[{i}/{len(videos)}] {video['course']}{mod} / {filename}")
         if download_with_ytdlp(video, out_path):
             success += 1
             if not args.no_nfo:
-                write_nfo(video, out_path, video["course"])
+                write_nfo(video, out_path)
                 download_thumb(video, out_path)
             print("  \u2713 Downloaded")
         else:
