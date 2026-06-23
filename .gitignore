@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+
+# Runtime/auth artifacts
+.env
+cookies.json
+cookies.txt
+failed_downloads.txt
+
+# Generated output
+downloads/
+output/
+metadata.json
+video_links.txt
+*.part
+*.part-*
+*.ytdl
