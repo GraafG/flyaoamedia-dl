@@ -12,6 +12,7 @@ training.flyaoamedia.com runs on **Kajabi**, which serves course lessons with em
 2. Crawl your **Library** to discover every product (course) and its lessons
 3. Read each lesson page and find the embedded Wistia video
 4. Download the video with `yt-dlp`
+5. Mirror any downloadable files (PDFs, handouts, checklists, ZIPs) attached to the lesson
 
 Videos are organised per course:
 
@@ -131,6 +132,7 @@ downloads/
     001 - First Lesson.mp4
     001 - First Lesson.nfo
     001 - First Lesson.jpg
+    001 - First Lesson - Study_Guide.pdf
     002 - Second Lesson.mp4
     002 - Second Lesson.nfo
     002 - Second Lesson.jpg
@@ -142,10 +144,25 @@ Each video gets:
 - `.nfo` — Kodi/Jellyfin metadata (title, course, ordering, duration)
 - `.jpg` — Wistia thumbnail / poster art
 
+Lessons that have files in their Kajabi **downloads** dropdown (PDFs, handouts,
+checklists, ZIPs, etc.) also get those mirrored next to the video, named
+`NNN - Lesson Title - Original Filename.ext`. Lessons with downloadable files
+but no video (for example a course "Study Guide") are mirrored too.
+
 To skip NFO generation:
 
 ```powershell
 python -u download_videos.py --no-nfo
+```
+
+To control attachment mirroring:
+
+```powershell
+# Skip downloadable attachments entirely
+python -u download_videos.py --no-attachments
+
+# Only mirror attachments (skip videos) — handy when videos are already downloaded
+python -u download_videos.py --attachments-only
 ```
 
 ## Jellyfin

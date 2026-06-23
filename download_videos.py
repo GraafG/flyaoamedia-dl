@@ -18,6 +18,7 @@ Kodi/Jellyfin .nfo metadata and .jpg poster art are written alongside each video
 import argparse
 import html
 import json
+import mimetypes
 import os
 import re
 import subprocess
@@ -120,6 +121,12 @@ CATEGORY_LINK_RE = re.compile(
 )
 POST_CATEGORY_RE = re.compile(r"/categories/(\d+)/posts/")
 PRODUCT_SLUG_RE = re.compile(r"/products/([^/]+)")
+# Kajabi lesson "downloads" dropdown: each attachment is an <a class="downloads-link ...">
+# whose href points at /courses/downloads/<id>/<slug> and whose media-body holds the
+# real filename (e.g. "SAFETY_-_Aircraft_Lighting.pdf").
+ATTACHMENT_ANCHOR_RE = re.compile(r'<a\b[^>]*\bdownloads-link\b[^>]*>.*?</a>', re.I | re.S)
+ATTACHMENT_HREF_RE = re.compile(r'href="([^"]+)"', re.I)
+ATTACHMENT_NAME_RE = re.compile(r'media-body[^>]*>(.*?)</div>', re.I | re.S)
 
 
 def session_factory():
@@ -293,6 +300,26 @@ def _strip_html(value):
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", value)).strip()
 
 
+def _extract_attachments(page):
+    """Return [{'url':..., 'name':...}] for every downloadable file on a lesson page."""
+    attachments = []
+    seen = set()
+    for block in ATTACHMENT_ANCHOR_RE.findall(page):
+        href_match = ATTACHMENT_HREF_RE.search(block)
+        if not href_match:
+            continue
+        url = html.unescape(href_match.group(1)).strip()
+        if not url or url in seen:
+            continue
+        name_match = ATTACHMENT_NAME_RE.search(block)
+        name = _strip_html(html.unescape(name_match.group(1))) if name_match else ""
+        if not name:
+            name = urllib.parse.unquote(url.rstrip("/").split("/")[-1])
+        seen.add(url)
+        attachments.append({"url": url, "name": name})
+    return attachments
+
+
 def parse_post(session, url):
     """Fetch a lesson page and extract its title, description and Wistia hashed id."""
     try:
@@ -331,6 +358,7 @@ def parse_post(session, url):
         "description": description,
         "hashed_id": hashed_id,
         "category_id": cat_id_match.group(1) if cat_id_match else "",
+        "attachments": _extract_attachments(page),
     }
 
 
@@ -431,6 +459,70 @@ def download_thumb(video, out_path):
         pass
 
 
+def _attachment_extension(response):
+    """Best-effort file extension (with dot) from response headers, or ''."""
+    cd = response.headers.get("Content-Disposition", "")
+    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.I)
+    if m:
+        server_name = urllib.parse.unquote(m.group(1)).strip()
+        ext = os.path.splitext(server_name)[1]
+        if ext:
+            return ext
+    ctype = (response.headers.get("Content-Type", "") or "").split(";")[0].strip()
+    if ctype:
+        ext = mimetypes.guess_extension(ctype)
+        if ext:
+            return ".jpg" if ext == ".jpe" else ext
+    return ""
+
+
+def download_attachments(session, video, out_dir, prefix):
+    """Mirror a lesson's downloadable files next to its video. Returns (saved, failed)."""
+    attachments = video.get("attachments") or []
+    if not attachments:
+        return 0, 0
+    saved = 0
+    failed = 0
+    for att in attachments:
+        base = safe_filename(att.get("name", "")) or "attachment"
+        stem = f"{prefix} - {base}"
+        has_ext = bool(re.search(r"\.[A-Za-z0-9]{1,8}$", base))
+        if has_ext:
+            dest = out_dir / stem
+            if dest.exists() and dest.stat().st_size > 0:
+                print(f"  [skip] Attachment exists: {dest.name}")
+                continue
+        else:
+            # Extension comes from the server; skip if we already saved any variant.
+            existing = [p for p in out_dir.glob(safe_filename(stem) + ".*") if p.stat().st_size > 0]
+            if existing:
+                print(f"  [skip] Attachment exists: {existing[0].name}")
+                continue
+            dest = None
+        try:
+            r = session.get(att["url"], allow_redirects=True, stream=True, timeout=120)
+            r.raise_for_status()
+            if dest is None:
+                dest = out_dir / (stem + _attachment_extension(r))
+            if dest.exists() and dest.stat().st_size > 0:
+                r.close()
+                print(f"  [skip] Attachment exists: {dest.name}")
+                continue
+            tmp = dest.with_name(dest.name + ".part")
+            with open(tmp, "wb") as fh:
+                for chunk in r.iter_content(65536):
+                    if chunk:
+                        fh.write(chunk)
+            r.close()
+            tmp.replace(dest)
+            saved += 1
+            print(f"  [attach] Saved {dest.name}")
+        except Exception as exc:  # noqa: BLE001 - report and continue
+            failed += 1
+            print(f"  [attach] FAILED {att.get('url', '')}: {exc}")
+    return saved, failed
+
+
 def export_cookies(session, filepath):
     """Write the requests session cookies to a Netscape cookie file for yt-dlp."""
     lines = ["# Netscape HTTP Cookie File"]
@@ -519,6 +611,8 @@ def main():
     parser.add_argument("--product", default="", help="Only process products whose URL contains this text.")
     parser.add_argument("--metadata-only", action="store_true", help="Only refresh metadata.json / video_links.txt.")
     parser.add_argument("--no-nfo", action="store_true", help="Skip writing .nfo and .jpg files.")
+    parser.add_argument("--no-attachments", action="store_true", help="Skip downloading lesson file attachments.")
+    parser.add_argument("--attachments-only", action="store_true", help="Only mirror lesson attachments; skip video downloads.")
     parser.add_argument("--list", action="store_true", help="List discovered products and lessons, then exit.")
     parser.add_argument(
         "--refresh",
@@ -571,35 +665,56 @@ def main():
         print("[*] Metadata refreshed; no downloads requested.")
         return
 
-    videos = [v for v in all_videos if v.get("hashed_id")]
+    # Process every lesson: download its video (if any) and mirror its attachments.
+    lessons = all_videos
     if args.limit > 0:
-        videos = videos[:args.limit]
+        lessons = lessons[:args.limit]
 
+    video_count = sum(1 for v in lessons if v.get("hashed_id"))
     success = 0
     failed = []
-    for i, video in enumerate(videos, 1):
+    att_saved = 0
+    att_failed = 0
+    for i, video in enumerate(lessons, 1):
         course_dir = OUTPUT_DIR / video["course"]
         course_dir.mkdir(parents=True, exist_ok=True)
         filename = f"{video['order']:03d} - {safe_filename(video['title'])}"
         out_path = course_dir / f"{filename}.mp4"
 
         mod = f" [{video['module']}]" if video.get("module") else ""
-        print(f"\n[{i}/{len(videos)}] {video['course']}{mod} / {filename}")
-        if download_with_ytdlp(video, out_path):
-            success += 1
-            if not args.no_nfo:
-                write_nfo(video, out_path)
-                download_thumb(video, out_path)
-            print("  \u2713 Downloaded")
-        else:
-            failed.append(video["url"])
-            print("  \u2717 Failed")
+        n_att = len(video.get("attachments") or [])
+        att_note = f" ({n_att} attachment{'s' if n_att != 1 else ''})" if n_att else ""
+        print(f"\n[{i}/{len(lessons)}] {video['course']}{mod} / {filename}{att_note}")
 
-    print(f"\n=== Done: {success}/{len(videos)} downloaded ===")
+        if video.get("hashed_id") and not args.attachments_only:
+            if download_with_ytdlp(video, out_path):
+                success += 1
+                if not args.no_nfo:
+                    write_nfo(video, out_path)
+                    download_thumb(video, out_path)
+                print("  \u2713 Downloaded")
+            else:
+                failed.append(video["url"])
+                print("  \u2717 Failed")
+        elif not video.get("hashed_id"):
+            print("  [info] No video on this lesson.")
+
+        if not args.no_attachments:
+            saved, fail = download_attachments(session, video, course_dir, filename)
+            att_saved += saved
+            att_failed += fail
+
+    if args.attachments_only:
+        print(f"\n=== Done: {att_saved} attachment(s) mirrored ===")
+    else:
+        print(f"\n=== Done: {success}/{video_count} videos downloaded, "
+              f"{att_saved} attachment(s) mirrored ===")
+    if att_failed:
+        print(f"[!] {att_failed} attachment(s) failed to download.")
     if failed:
         failed_file = ROOT_DIR / "failed_downloads.txt"
         failed_file.write_text("\n".join(failed), encoding="utf-8")
-        print(f"[!] {len(failed)} failed - saved to {failed_file.name}")
+        print(f"[!] {len(failed)} video(s) failed - saved to {failed_file.name}")
 
 
 if __name__ == "__main__":
