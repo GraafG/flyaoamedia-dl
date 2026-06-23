@@ -36,6 +36,13 @@ except ImportError:
 if load_dotenv:
     load_dotenv()
 
+# Make console output safe on Windows terminals that default to cp1252.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 BASE_URL = os.getenv("FLYAOA_BASE_URL", "https://training.flyaoamedia.com").rstrip("/")
 LOGIN_URL = f"{BASE_URL}/login"
 LIBRARY_URL = f"{BASE_URL}/library"
@@ -199,7 +206,8 @@ def parse_post(session, url):
     hashed_id = match.group(1) if match else None
 
     title = (
-        _text(r'<h1[^>]*class="[^"]*(?:post|lesson|title)[^"]*"[^>]*>(.*?)</h1>', page)
+        _text(r'<h1[^>]*class="[^"]*post-body-title[^"]*"[^>]*>(.*?)</h1>', page)
+        or _text(r'<h1[^>]*class="[^"]*(?:post|lesson)[^"]*title[^"]*"[^>]*>(.*?)</h1>', page)
         or _text(r"<h1[^>]*>(.*?)</h1>", page)
         or _text(r"<title>(.*?)</title>", page)
     )
