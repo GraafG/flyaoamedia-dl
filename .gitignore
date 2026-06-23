@@ -15,3 +15,7 @@ video_links.txt
 *.part
 *.part-*
 *.ytdl
+
+# Logs
+*.log
+*.err

@@ -22,11 +22,18 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 import requests
+from requests.adapters import HTTPAdapter
+
+try:
+    from urllib3.util.retry import Retry
+except ImportError:  # pragma: no cover - very old urllib3
+    Retry = None
 
 try:
     from dotenv import load_dotenv
@@ -43,6 +50,45 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
+
+class _Tee:
+    """Write stream output to the console and a log file simultaneously."""
+
+    def __init__(self, stream, fh):
+        self._stream = stream
+        self._fh = fh
+
+    def write(self, data):
+        self._stream.write(data)
+        try:
+            self._fh.write(data)
+            self._fh.flush()
+        except (ValueError, OSError):
+            pass
+        return len(data)
+
+    def flush(self):
+        self._stream.flush()
+        try:
+            self._fh.flush()
+        except (ValueError, OSError):
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _enable_file_logging(path):
+    """Mirror stdout/stderr to a log file so detached runs stay observable."""
+    try:
+        fh = open(path, "a", encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    fh.write(f"\n=== RUN {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+    fh.flush()
+    sys.stdout = _Tee(sys.stdout, fh)
+    sys.stderr = _Tee(sys.stderr, fh)
+
 BASE_URL = os.getenv("FLYAOA_BASE_URL", "https://training.flyaoamedia.com").rstrip("/")
 LOGIN_URL = f"{BASE_URL}/login"
 LIBRARY_URL = f"{BASE_URL}/library"
@@ -54,7 +100,10 @@ OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", ROOT_DIR / "downloads"))
 COOKIES_TXT = ROOT_DIR / "cookies.txt"
 METADATA_FILE = ROOT_DIR / "metadata.json"
 LINKS_FILE = ROOT_DIR / "video_links.txt"
+LOG_FILE = Path(os.getenv("LOG_FILE", ROOT_DIR / "download.log"))
 FRAGMENT_CONCURRENCY = os.getenv("YTDLP_CONCURRENT_FRAGMENTS", "16")
+# Polite crawl delay (seconds) between page requests, to avoid HTTP 429s.
+REQUEST_DELAY = float(os.getenv("FLYAOA_REQUEST_DELAY", "1.0"))
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -76,7 +125,31 @@ PRODUCT_SLUG_RE = re.compile(r"/products/([^/]+)")
 def session_factory():
     s = requests.Session()
     s.headers.update({"User-Agent": USER_AGENT})
+    if Retry is not None:
+        retry = Retry(
+            total=6,
+            connect=4,
+            read=4,
+            status=6,
+            backoff_factor=2.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST"]),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
     return s
+
+
+def fetch(session, url, **kwargs):
+    """GET a URL politely: enforce a small inter-request delay and raise on error."""
+    if REQUEST_DELAY > 0:
+        time.sleep(REQUEST_DELAY)
+    r = session.get(url, timeout=60, **kwargs)
+    r.raise_for_status()
+    return r
 
 
 def _csrf_token(page_html):
@@ -141,8 +214,7 @@ def discover_products(session):
     seen = set()
     for seed in (LIBRARY_URL, BASE_URL + "/"):
         try:
-            r = session.get(seed, timeout=30)
-            r.raise_for_status()
+            r = fetch(session, seed)
         except requests.RequestException as exc:
             print(f"[!] Could not load {seed}: {exc}")
             continue
@@ -161,8 +233,7 @@ def discover_products(session):
 def discover_product_meta(session, product_url):
     """Return (product_title, {category_id: category_name}) for a product."""
     try:
-        r = session.get(product_url, timeout=30)
-        r.raise_for_status()
+        r = fetch(session, product_url)
     except requests.RequestException as exc:
         print(f"[!] Could not load {product_url}: {exc}")
         return "", {}
@@ -193,8 +264,7 @@ def discover_posts(session, product_url):
             continue
         visited.add(url)
         try:
-            r = session.get(url, timeout=30)
-            r.raise_for_status()
+            r = fetch(session, url)
         except requests.RequestException as exc:
             print(f"[!] Could not load {url}: {exc}")
             continue
@@ -226,8 +296,7 @@ def _strip_html(value):
 def parse_post(session, url):
     """Fetch a lesson page and extract its title, description and Wistia hashed id."""
     try:
-        r = session.get(url, timeout=30)
-        r.raise_for_status()
+        r = fetch(session, url)
     except requests.RequestException as exc:
         print(f"[!] Could not load {url}: {exc}")
         return None
@@ -411,30 +480,14 @@ def download_with_ytdlp(video, out_path):
     return False
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Download your FlyAOA Media training videos for offline personal use."
-    )
-    parser.add_argument("--limit", type=int, default=0, help="Download at most N videos.")
-    parser.add_argument("--product", default="", help="Only process products whose URL contains this text.")
-    parser.add_argument("--metadata-only", action="store_true", help="Only refresh metadata.json / video_links.txt.")
-    parser.add_argument("--no-nfo", action="store_true", help="Skip writing .nfo and .jpg files.")
-    parser.add_argument("--list", action="store_true", help="List discovered products and lessons, then exit.")
-    args = parser.parse_args()
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    print("=== FlyAOA Media Training Downloader ===\n")
-
-    session = session_factory()
-    if not login(session):
-        sys.exit(1)
-
+def crawl_all(session, product_filter=""):
+    """Log in already done by caller. Crawl every product and return lesson metadata."""
     products = discover_products(session)
-    if args.product:
-        products = [p for p in products if args.product in p]
+    if product_filter:
+        products = [p for p in products if product_filter in p]
     if not products:
         print("[!] No products found. The library layout may have changed.")
-        sys.exit(1)
+        return []
 
     all_videos = []
     for product_url in products:
@@ -455,11 +508,56 @@ def main():
             info["order"] = order
             info.update({k: v for k, v in wistia_meta(info["hashed_id"]).items() if v})
             all_videos.append(info)
+    return all_videos
 
-    # Persist metadata + links.
-    METADATA_FILE.write_text(json.dumps(all_videos, indent=2, ensure_ascii=False), encoding="utf-8")
-    LINKS_FILE.write_text("\n".join(v["url"] for v in all_videos), encoding="utf-8")
-    print(f"\n[*] Saved metadata for {len(all_videos)} lessons -> {METADATA_FILE.name}")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Download your FlyAOA Media training videos for offline personal use."
+    )
+    parser.add_argument("--limit", type=int, default=0, help="Download at most N videos.")
+    parser.add_argument("--product", default="", help="Only process products whose URL contains this text.")
+    parser.add_argument("--metadata-only", action="store_true", help="Only refresh metadata.json / video_links.txt.")
+    parser.add_argument("--no-nfo", action="store_true", help="Skip writing .nfo and .jpg files.")
+    parser.add_argument("--list", action="store_true", help="List discovered products and lessons, then exit.")
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Force a fresh crawl even if metadata.json exists (default reuses the cache when downloading).",
+    )
+    args = parser.parse_args()
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    _enable_file_logging(LOG_FILE)
+    print("=== FlyAOA Media Training Downloader ===\n")
+
+    session = session_factory()
+    if not login(session):
+        sys.exit(1)
+
+    # Reuse cached metadata for plain download/resume runs to avoid re-crawling
+    # every lesson page (which can trip rate limits). Force a crawl for
+    # --metadata-only, --list, --refresh, or when no cache exists yet.
+    cached = []
+    if METADATA_FILE.exists():
+        try:
+            cached = json.loads(METADATA_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            cached = []
+
+    need_crawl = args.refresh or args.metadata_only or args.list or not cached
+    if need_crawl:
+        all_videos = crawl_all(session, args.product)
+        # Persist metadata + links.
+        METADATA_FILE.write_text(json.dumps(all_videos, indent=2, ensure_ascii=False), encoding="utf-8")
+        LINKS_FILE.write_text("\n".join(v["url"] for v in all_videos), encoding="utf-8")
+        print(f"\n[*] Saved metadata for {len(all_videos)} lessons -> {METADATA_FILE.name}")
+    else:
+        all_videos = cached
+        if args.product:
+            all_videos = [v for v in all_videos if args.product in v.get("url", "")]
+        print(f"[*] Using cached metadata for {len(all_videos)} lessons "
+              f"(run with --refresh to re-crawl).")
     export_cookies(session, COOKIES_TXT)
 
     if args.list:

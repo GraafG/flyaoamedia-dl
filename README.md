@@ -80,12 +80,21 @@ Refresh metadata only:
 python -u download_videos.py --metadata-only
 ```
 
+By default the downloader **reuses the cached `metadata.json`** when it exists, so
+resuming an interrupted run does not re-crawl every lesson page (which can trip the
+site's rate limiting). Force a fresh crawl with `--refresh`:
+
+```powershell
+python -u download_videos.py --refresh
+```
+
 The tool will:
 
 - Log in to the training site
 - Save lesson metadata in `metadata.json`
 - Save lesson URLs in `video_links.txt`
 - Download videos into `downloads\<Course Name>\`
+- Mirror all console output to `download.log`
 - Skip previously downloaded `.mp4` files
 - Resume safely when you run it again
 
@@ -100,6 +109,8 @@ All settings can be configured in `.env`:
 | `FLYAOA_BASE_URL` | Base URL of the training site | `https://training.flyaoamedia.com` |
 | `OUTPUT_DIR` | Folder for downloaded videos | `./downloads` |
 | `YTDLP_CONCURRENT_FRAGMENTS` | Parallel HLS/DASH fragment downloads | `16` |
+| `FLYAOA_REQUEST_DELAY` | Seconds to wait between crawl requests (avoids HTTP 429) | `1.0` |
+| `LOG_FILE` | Path for the mirrored run log | `./download.log` |
 
 ## Speed
 
