@@ -1,6 +1,6 @@
 # flyaoamedia-dl
 
-Download your [FlyAOA Media](https://training.flyaoamedia.com) training videos so you can watch them offline.
+Download your [FlyAOA Media](https://training.flyaoamedia.com) training videos — **and the PDF handouts, checklists, study guides and other downloadable files attached to each lesson** — so you can watch and use them offline.
 
 Requires an active FlyAOA Media training membership with access to the courses.
 
@@ -14,12 +14,13 @@ training.flyaoamedia.com runs on **Kajabi**, which serves course lessons with em
 4. Download the video with `yt-dlp`
 5. Mirror any downloadable files (PDFs, handouts, checklists, ZIPs) attached to the lesson
 
-Videos are organised per course:
+Videos and their lesson files are organised per course:
 
 ```text
 downloads/
   Course Name/
     001 - First Lesson.mp4
+    001 - First Lesson - Study_Guide.pdf
     002 - Second Lesson.mp4
 ```
 
