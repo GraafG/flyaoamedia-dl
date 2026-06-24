@@ -185,6 +185,14 @@ Report bugs or suggest features via [GitHub Issues](../../issues).
 
 Security issues? See [SECURITY.md](SECURITY.md).
 
+## Related tools
+
+Other personal-use download tools for paid subscriptions:
+
+- [tylerraw-dl](https://github.com/GraafG/tylerraw-dl) — Tyler Raw subscription videos
+- [elektormagazine-dl](https://github.com/GraafG/elektormagazine-dl) — Elektor Magazine issues as PDF
+- [consumentenbond-dl](https://github.com/GraafG/consumentenbond-dl) — Consumentenbond publications as PDF
+
 ## Disclaimer
 
 This tool is intended for personal use by paying FlyAOA Media members to watch their own accessible training videos offline. Do not share downloaded files — respect FlyAOA Media's copyright and terms.
