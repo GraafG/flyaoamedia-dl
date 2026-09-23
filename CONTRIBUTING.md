@@ -26,6 +26,23 @@ Contributions are welcome!
 
 ## Development
 
+Run the offline checks without an account or `.env` file:
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install ruff
+python -m py_compile download_videos.py
+python -m unittest discover -s tests -v
+ruff check download_videos.py tests
+python -m pip check
+```
+
+The regression tests mock network and subprocess calls, isolate environment
+variables, and replace dotenv loading. They use only synthetic data and temporary
+files. CI runs these checks on Python 3.11 and 3.12.
+
+Only for a separate, explicitly intended live run with your own account:
+
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
