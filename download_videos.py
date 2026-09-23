@@ -26,6 +26,8 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from contextlib import ExitStack, contextmanager
+from http.client import HTTPException
 from pathlib import Path
 
 import requests
@@ -79,16 +81,25 @@ class _Tee:
         return getattr(self._stream, name)
 
 
+@contextmanager
 def _enable_file_logging(path):
     """Mirror stdout/stderr to a log file so detached runs stay observable."""
-    try:
-        fh = open(path, "a", encoding="utf-8", errors="replace")
-    except OSError:
-        return
-    fh.write(f"\n=== RUN {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
-    fh.flush()
-    sys.stdout = _Tee(sys.stdout, fh)
-    sys.stderr = _Tee(sys.stderr, fh)
+    with ExitStack() as stack:
+        try:
+            fh = stack.enter_context(open(path, "a", encoding="utf-8", errors="replace"))
+        except OSError as exc:
+            print(f"[!] Could not open log file {path}: {exc}", file=sys.stderr)
+            yield
+            return
+        fh.write(f"\n=== RUN {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        fh.flush()
+        stdout, stderr = sys.stdout, sys.stderr
+        sys.stdout = _Tee(stdout, fh)
+        sys.stderr = _Tee(stderr, fh)
+        try:
+            yield
+        finally:
+            sys.stdout, sys.stderr = stdout, stderr
 
 BASE_URL = os.getenv("FLYAOA_BASE_URL", "https://training.flyaoamedia.com").rstrip("/")
 LOGIN_URL = f"{BASE_URL}/login"
@@ -111,22 +122,22 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-WISTIA_RE = re.compile(r"wistia_async_([a-z0-9]{8,})", re.I)
-WISTIA_EMBED_RE = re.compile(r"(?:fast\.wistia\.(?:com|net)/embed/(?:iframe|medias)/|wvideo=)([a-z0-9]{8,})", re.I)
-POST_HREF_RE = re.compile(r'href="([^"#?]*?/posts/[^"#?]+)"', re.I)
-PRODUCT_HREF_RE = re.compile(r'href="([^"#?]*?/(?:library/)?products/[^"#?]+)"', re.I)
-CATEGORY_HREF_RE = re.compile(r'href="([^"#?]*?/categories/[^"#?]+)"', re.I)
+WISTIA_RE = re.compile(r"wistia_async_([a-z0-9]{8,})", re.IGNORECASE)
+WISTIA_EMBED_RE = re.compile(r"(?:fast\.wistia\.(?:com|net)/embed/(?:iframe|medias)/|wvideo=)([a-z0-9]{8,})", re.IGNORECASE)
+POST_HREF_RE = re.compile(r'href="([^"#?]*?/posts/[^"#?]+)"', re.IGNORECASE)
+PRODUCT_HREF_RE = re.compile(r'href="([^"#?]*?/(?:library/)?products/[^"#?]+)"', re.IGNORECASE)
+CATEGORY_HREF_RE = re.compile(r'href="([^"#?]*?/categories/[^"#?]+)"', re.IGNORECASE)
 CATEGORY_LINK_RE = re.compile(
-    r'<a[^>]+href="[^"]+/categories/(\d+)"[^>]*>(.*?)</a>', re.I | re.S
+    r'<a[^>]+href="[^"]+/categories/(\d+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL
 )
 POST_CATEGORY_RE = re.compile(r"/categories/(\d+)/posts/")
 PRODUCT_SLUG_RE = re.compile(r"/products/([^/]+)")
 # Kajabi lesson "downloads" dropdown: each attachment is an <a class="downloads-link ...">
 # whose href points at /courses/downloads/<id>/<slug> and whose media-body holds the
 # real filename (e.g. "SAFETY_-_Aircraft_Lighting.pdf").
-ATTACHMENT_ANCHOR_RE = re.compile(r'<a\b[^>]*\bdownloads-link\b[^>]*>.*?</a>', re.I | re.S)
-ATTACHMENT_HREF_RE = re.compile(r'href="([^"]+)"', re.I)
-ATTACHMENT_NAME_RE = re.compile(r'media-body[^>]*>(.*?)</div>', re.I | re.S)
+ATTACHMENT_ANCHOR_RE = re.compile(r'<a\b[^>]*\bdownloads-link\b[^>]*>.*?</a>', re.IGNORECASE | re.DOTALL)
+ATTACHMENT_HREF_RE = re.compile(r'href="([^"]+)"', re.IGNORECASE)
+ATTACHMENT_NAME_RE = re.compile(r'media-body[^>]*>(.*?)</div>', re.IGNORECASE | re.DOTALL)
 
 
 def session_factory():
@@ -292,7 +303,7 @@ def discover_posts(session, product_url):
 
 
 def _text(pattern, page_html, default=""):
-    m = re.search(pattern, page_html, re.I | re.S)
+    m = re.search(pattern, page_html, re.IGNORECASE | re.DOTALL)
     return html.unescape(m.group(1)).strip() if m else default
 
 
@@ -340,12 +351,12 @@ def parse_post(session, url):
     )
     title = _strip_html(title)
 
-    body_match = re.search(r'<div[^>]*class="[^"]*post-body[^"]*"[^>]*>(.*?)</div>\s*</div>', page, re.S)
+    body_match = re.search(r'<div[^>]*class="[^"]*post-body[^"]*"[^>]*>(.*?)</div>\s*</div>', page, re.DOTALL)
     description = ""
     if body_match:
         plain = _strip_html(html.unescape(body_match.group(1)))
         # Trim the leading "Title View Time= 5:51" boilerplate Kajabi prints above the body.
-        plain = re.sub(r"^.{0,200}?View Time\s*=\s*\d+:\d+\s*", "", plain, count=1, flags=re.I)
+        plain = re.sub(r"^.{0,200}?View Time\s*=\s*\d+:\d+\s*", "", plain, count=1, flags=re.IGNORECASE)
         # And strip the title itself if it leads.
         if title and plain.startswith(title):
             plain = plain[len(title):].lstrip(" -|:")
@@ -371,7 +382,8 @@ def wistia_meta(hashed_id):
         req = urllib.request.Request(api, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.load(resp)
-    except Exception:
+    except (OSError, ValueError, HTTPException) as exc:
+        print(f"[!] Could not load Wistia metadata for {hashed_id}: {exc}")
         return {}
     media = data.get("media", {})
     assets = media.get("assets", [])
@@ -455,14 +467,14 @@ def download_thumb(video, out_path):
         with urllib.request.urlopen(req, timeout=15) as resp:
             thumb_path.write_bytes(resp.read())
         print(f"  [thumb] Saved {thumb_path.name}")
-    except Exception:
-        pass
+    except (OSError, ValueError, HTTPException) as exc:
+        print(f"  [thumb] Could not save {thumb_path.name}: {exc}")
 
 
 def _attachment_extension(response):
     """Best-effort file extension (with dot) from response headers, or ''."""
     cd = response.headers.get("Content-Disposition", "")
-    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.I)
+    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.IGNORECASE)
     if m:
         server_name = urllib.parse.unquote(m.group(1)).strip()
         ext = os.path.splitext(server_name)[1]
@@ -567,7 +579,7 @@ def download_with_ytdlp(video, out_path):
             cmd += list(target[:-1]) + [target[-1]]
         else:
             cmd.append(target)
-        if subprocess.run(cmd).returncode == 0 and out_path.exists():
+        if subprocess.run(cmd, check=False).returncode == 0 and out_path.exists():
             return True
     return False
 
@@ -622,7 +634,11 @@ def main():
     args = parser.parse_args()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    _enable_file_logging(LOG_FILE)
+    with _enable_file_logging(LOG_FILE):
+        _run(args)
+
+
+def _run(args):
     print("=== FlyAOA Media Training Downloader ===\n")
 
     session = session_factory()
